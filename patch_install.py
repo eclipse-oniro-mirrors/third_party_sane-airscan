@@ -135,6 +135,7 @@ def _apply_patch_locked(source_dir):
         'oh-fix-http-body-limit.patch',
         'oh-fix-empty-source-caps.patch',
         'oh-fix-eloop-uv-run-mutex-serialization.patch',
+        'oh-fix-skip-branch-buffer-capacity.patch',
     ]
 
     # Verify and transform a private copy first. This accepts both pristine and
