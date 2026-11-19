@@ -1,0 +1,30 @@
+diff --git a/airscan-device.c b/airscan-device.c
+index eb9f3ae..9ab76bc 100644
+--- a/airscan-device.c
++++ b/airscan-device.c
+@@ -1639,7 +1639,8 @@ device_read_next (device *dev)
+         dev->read_line_end = 0;
+         dev->read_skip_bytes = 0;
+         dev->read_line_real_wid = 0;
+-        line_capacity = dev->opt.params.bytes_per_line;
++        line_capacity = math_max(dev->opt.params.bytes_per_line,
++                                 params.bytes_per_line);
+     } else {
+         image_window win;
+         int          bpp = dev->opt.params.format == SANE_FRAME_RGB ? 3 : 1;
+@@ -1674,6 +1675,7 @@ device_read_next (device *dev)
+ 
+         line_capacity = math_max(line_capacity, returned_size_and_skip);
+         dev->read_line_real_wid = win.wid;
++        dev->read_line_end = hei - skip_lines;
+     }
+ 
+     /* Initialize image decoding */
+@@ -1682,7 +1684,6 @@ device_read_next (device *dev)
+ 
+     dev->read_line_num = 0;
+     dev->read_line_off = dev->opt.params.bytes_per_line;
+-    dev->read_line_end = hei - skip_lines;
+ 
+     for (;skip_lines > 0; skip_lines --) {
+         err = image_decoder_read_line(decoder, dev->read_line_buf);
