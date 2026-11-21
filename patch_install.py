@@ -136,6 +136,7 @@ def _apply_patch_locked(source_dir):
         'oh-fix-empty-source-caps.patch',
         'oh-fix-eloop-uv-run-mutex-serialization.patch',
         'oh-fix-skip-branch-buffer-capacity.patch',
+        'oh-escl-https-tofu.patch',
     ]
 
     # Verify and transform a private copy first. This accepts both pristine and

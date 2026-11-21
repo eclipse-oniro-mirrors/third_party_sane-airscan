@@ -27,6 +27,7 @@ action("airscan_action") {
     "${source_dir}/patches/oh-fix-empty-source-caps.patch",
     "${source_dir}/patches/oh-fix-eloop-uv-run-mutex-serialization.patch",
     "${source_dir}/patches/oh-fix-skip-branch-buffer-capacity.patch",
+    "${source_dir}/patches/oh-escl-https-tofu.patch",
   ]
   outputs = [ "${target_gen_dir}/patches.complete" ]
   depfile = "${target_gen_dir}/patches.d"
@@ -99,6 +100,8 @@ ohos_shared_library("sane-airscan") {
     "libpng:libpng",
     "libuv:uv",
     "libxml2:libxml2",
+    "openssl:libcrypto_shared",
+    "openssl:libssl_shared",
   ]
 
   ldflags = [ "-ldl" ]
