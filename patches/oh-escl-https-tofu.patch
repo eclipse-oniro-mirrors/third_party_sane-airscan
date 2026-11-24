@@ -1,0 +1,932 @@
+diff --git a/airscan-device.c b/airscan-device.c
+index eb9f3ae..28a7775 100644
+--- a/airscan-device.c
++++ b/airscan-device.c
+@@ -126,6 +126,10 @@ struct device {
+     /* I/O handling (AVAHI and HTTP) */
+     zeroconf_endpoint    *endpoint_current; /* Current endpoint to probe */
+ 
++    /* TOFU cert change seen during the open-time probe (no onerror
++     * handler yet), returned by device_open(). */
++    SANE_Status          probe_status;
++
+     /* Job status */
+     SANE_Status          job_status;          /* Job completion status */
+     SANE_Word            job_skip_x;          /* How much pixels to skip, */
+@@ -165,7 +171,7 @@ static void
+ device_http_cancel (device *dev);
+ 
+ static void
+-device_http_onerror (void *ptr, error err);
++device_http_onerror (void *ptr, error err, http_tls_err_class tls_class);
+ 
+ static void
+ device_proto_set (device *dev, ID_PROTO proto);
+@@ -228,6 +234,8 @@ device_new (zeroconf_devinfo *devinfo)
+ 
+     devopt_init(&dev->opt);
+ 
++    dev->probe_status = SANE_STATUS_GOOD;
++
+     dev->proto_ctx.http = http_client_new(dev->log, dev);
+ 
+     pthread_cond_init(&dev->stm_cond, NULL);
+@@ -555,14 +563,23 @@ device_http_cancel (device *dev)
+ /* http_client onerror callback
+  */
+ static void
+-device_http_onerror (void *ptr, error err)
++device_http_onerror (void *ptr, error err, http_tls_err_class tls_class)
+ {
+     device      *dev = ptr;
+     SANE_Status status;
+ 
+-    status = err == ERROR_ENOMEM ? SANE_STATUS_NO_MEM : SANE_STATUS_IO_ERROR;
++    if (err == ERROR_ENOMEM) {
++        status = SANE_STATUS_NO_MEM;
++    } else if (tls_class == HTTP_TLS_ERR_TOFU_CHANGED) {
++        /* TOFU cert mismatch: distinct status for user prompt. */
++        status = SANE_STATUS_TLS_CERT_CHANGED;
++    } else {
++        /* Other TLS failures stay IO_ERROR; frontend probes plain HTTP. */
++        status = SANE_STATUS_IO_ERROR;
++    }
+ 
+-    log_debug(dev->log, "cancelling job due to error: %s", ESTRING(err));
++    log_debug(dev->log, "cancelling job due to error: %s (tls_class=%d)",
++        ESTRING(err), (int) tls_class);
+ 
+     if (!device_stm_cancel_perform(dev, status)) {
+         device_stm_state_set(dev, DEVICE_STM_DONE);
+@@ -655,6 +677,13 @@ DONE:
+     if (err != NULL) {
+         log_debug(dev->log, ESTRING(err));
+ 
++        /* Probe has no onerror handler; save TOFU change for device_open(). */
++        if (http_query_tls_err_class(q) == HTTP_TLS_ERR_TOFU_CHANGED &&
++            dev->probe_status != SANE_STATUS_TLS_CERT_CHANGED) {
++            log_debug(dev->log, "probe: TOFU certificate changed");
++            dev->probe_status = SANE_STATUS_TLS_CERT_CHANGED;
++        }
++
+         if (dev->endpoint_current != NULL &&
+             dev->endpoint_current->next != NULL) {
+             device_probe_endpoint(dev, dev->endpoint_current->next);
+@@ -1204,8 +1237,11 @@ device_open (const char *ident, SANE_Status *status)
+         eloop_cond_wait(&dev->stm_cond);
+     }
+     if (device_stm_state_get(dev) == DEVICE_STM_PROBING_FAILED) {
++        /* Propagate a TOFU change from the probe; else generic IO error. */
++        SANE_Status probe_status = dev->probe_status;
+         device_free(dev, NULL);
+-        *status = SANE_STATUS_IO_ERROR;
++        *status = (probe_status != SANE_STATUS_GOOD) ? probe_status
++                                                     : SANE_STATUS_IO_ERROR;
+         return NULL;
+     }
+     
+diff --git a/airscan-http.c b/airscan-http.c
+index 668cc62..4c41a85 100644
+--- a/airscan-http.c
++++ b/airscan-http.c
+@@ -23,8 +23,13 @@
+ 
+ #ifndef OH_AIRSCAN
+ #include <avahi-common/domain.h>
+-#include <gnutls/gnutls.h>
+ #endif // OH_AIRSCAN
++#include <openssl/ssl.h>
++#include <openssl/err.h>
++#include <openssl/x509.h>
++#include <dirent.h>
++#include <sys/stat.h>
++#include <stdio.h>
+ 
+ /******************** Constants ********************/
+ /* I/O buffer size
+@@ -43,17 +48,15 @@
+ /* Maximum response body size, bytes. Guards against memory exhaustion
+  * caused by a malicious peer streaming an oversized (or unbounded
+  * chunked) response. Covers all ops including eSCL LOAD image download
+- * and sane_open() devcaps probing. Override via BUILD.gn cflags
+- * (-DHTTP_MAX_BODY_SIZE=...) if a product needs a different ceiling.
++ * and sane_open() devcaps probing.
+  */
+ #ifndef HTTP_MAX_BODY_SIZE
+ #define HTTP_MAX_BODY_SIZE      (1024ULL * 1024ULL * 1024ULL)
+ #endif
+ 
+-#ifndef OH_AIRSCAN
+ /******************** Static variables ********************/
+-static gnutls_certificate_credentials_t gnutls_cred;
+-#endif // OH_AIRSCAN
++static SSL_CTX *ssl_ctx;
++#define TLS_CERT_DIR "/data/service/el1/public/print_service/sane/certs"
+ 
+ /******************** Forward declarations ********************/
+ typedef struct http_multipart http_multipart;
+@@ -70,6 +73,9 @@ http_query_timeout_cancel (http_query *q);
+ static http_query*
+ http_query_by_ll_node (ll_node *node);
+ 
++static int
++http_tfu_check (http_query *q);
++
+ static void
+ http_query_complete (http_query *q, error err);
+ 
+@@ -947,7 +953,7 @@ http_uri_host_is (const http_uri *uri, const char *host)
+     }
+ 
+     return avahi_domain_equal(uri_host, host);
+-#else 
++#else
+     return false;
+ #endif // OH_AIRSCAN
+ }
+@@ -1957,8 +1963,7 @@ struct http_client {
+     void       *ptr;       /* Callback's user data */
+     log_ctx    *log;       /* Logging context */
+     ll_head    pending;    /* Pending queries */
+-    void       (*onerror)( /* Callback to be called on transport error */
+-            void *ptr, error err);
++    http_onerror_cb onerror; /* Callback to be called on transport error */
+ };
+ 
+ /* Create new http_client
+@@ -1990,8 +1995,7 @@ http_client_free (http_client *client)
+  * of the http_query callback
+  */
+ void
+-http_client_onerror (http_client *client,
+-        void (*onerror)(void *ptr, error err))
++http_client_onerror (http_client *client, http_onerror_cb onerror)
+ {
+     client->onerror = onerror;
+ }
+@@ -2067,14 +2071,15 @@ struct http_query {
+     bool              addrs_freeaddrinfo;       /* Use freeaddrinfo(addrs) */
+     struct addrinfo   *addr_next;               /* Next address to try */
+     int               sock;                     /* HTTP socket */
+-#ifndef OH_AIRSCAN
+-    gnutls_session_t  tls;                      /* NULL if not TLS */
++    SSL               *ssl;                     /* NULL if not TLS */
+     bool              handshake;                /* TLS handshake in progress */
+-#endif // OH_AIRSCAN
+     bool              sending;                  /* We are now sending */
+     eloop_fdpoll      *fdpoll;                  /* Polls q->sock */
+     ip_straddr        straddr;                  /* q->sock peer addr, for log */
+ 
++    /* TLS error class, passed to onerror. */
++    http_tls_err_class tls_err_class;
++
+     char              *rq_buf;                  /* Formatted request */
+     size_t            rq_off;                   /* send() offset in request */
+ 
+@@ -2093,8 +2099,7 @@ struct http_query {
+     /* Callbacks and context */
+     timestamp         timestamp;                /* Submission timestamp */
+     uintptr_t         uintptr;                  /* User-defined parameter */
+-    void              (*onerror) (void *ptr,    /* On-error callback */
+-                                error err);
++    http_onerror_cb   onerror;                  /* On-error callback */
+     void              (*onredir) (void *ptr,    /* On-redirect callback */
+                                 http_uri *uri,
+                                 const http_uri *orig_uri);
+@@ -2139,11 +2144,8 @@ http_query_reset (http_query *q)
+         q->addrs = NULL;
+         q->addr_next = NULL;
+     }
+-#ifndef OH_AIRSCAN
++
+     q->handshake = q->sending = false;
+-#else
+-    q->sending = false;
+-#endif // OH_AIRSCAN
+ 
+     http_query_disconnect(q);
+ 
+@@ -2168,17 +2170,17 @@ static void
+ http_query_free (http_query *q)
+ {
+     http_query_reset(q);
+-    
++
+     http_query_timeout_cancel(q);
+     http_uri_free(q->uri);
+     http_uri_free(q->real_uri);
+     http_uri_free(q->orig_uri);
+     http_hdr_cleanup(&q->request_header);
+-    
++
+     mem_free(q->rq_buf);
+-    
++
+     http_data_unref(q->request_data);
+-    
++
+     mem_free(q);
+ }
+ 
+@@ -2321,8 +2323,9 @@ static void
+ http_query_timeout_callback (void *p)
+ {
+     http_query *q = (http_query*) p;
+-    
++
+     q->timeout_timer = NULL; /* to prevent eloop_timer_cancel() */
++
+     http_query_complete(q, ERROR("timeout"));
+ }
+ 
+@@ -2335,10 +2338,10 @@ void
+ http_query_timeout (http_query *q, int timeout)
+ {
+     q->timeout_value = timeout;
+-    
++
+     if (q->submitted) {
+         http_query_timeout_cancel(q);
+-        
++
+         if (timeout >= 0) {
+             log_debug(q->client->log, "HTTP using timeout: %d ms",
+                 q->timeout_value);
+@@ -2394,7 +2397,7 @@ http_query_force_port(http_query *q, bool force_port) {
+  * transport error.
+  */
+ void
+-http_query_onerror (http_query *q, void (*onerror)(void *ptr, error err))
++http_query_onerror (http_query *q, http_onerror_cb onerror)
+ {
+     q->onerror = onerror;
+ }
+@@ -2588,7 +2591,7 @@ http_query_complete (http_query *q, error err)
+ 
+     /* Call user callback */
+     if (err != NULL && q->onerror != NULL) {
+-        q->onerror(client->ptr, err);
++        q->onerror(client->ptr, err, q->tls_err_class);
+     } else if (q->callback != NULL) {
+         q->callback(client->ptr, q);
+     }
+@@ -2709,17 +2712,17 @@ http_query_fdpoll_callback (int fd, void *data, ELOOP_FDPOLL_MASK mask)
+     (void) fd;
+     (void) mask;
+ 
+-#ifndef OH_AIRSCAN
+     if (q->handshake) {
+-        rc = gnutls_handshake(q->tls);
+-        if (rc < 0) {
+-            error err = http_query_sock_err(q, rc);
++        rc = SSL_connect(q->ssl);
++        if (rc <= 0) {
++            int ssl_err = SSL_get_error(q->ssl, rc);
++            error err = http_query_sock_err(q, -ssl_err);
+ 
+             if (err == NULL) {
+                 return;
+             }
+ 
+-            log_debug(q->client->log, "HTTP %s: gnutls_handshake(): %s",
++            log_debug(q->client->log, "HTTP %s: SSL_connect(): %s",
+                 q->straddr.text, ESTRING(err));
+ 
+             /* TLS handshake failed, try another address, if any */
+@@ -2729,14 +2732,25 @@ http_query_fdpoll_callback (int fd, void *data, ELOOP_FDPOLL_MASK mask)
+ 
+             return;
+         }
+-        log_debug(q->client->log, "HTTP done TLS handshake");
+-        
++
++        /* TLS handshake done; verify peer cert with TOFU. */
++        int tfu = http_tfu_check(q);
++        if (tfu != 0) {
++            /* TOFU rejected the peer: -1 = cert changed, 1 = save failed.
++             * Only a real change maps to TOFU_CHANGED. */
++            if (tfu < 0) {
++                q->tls_err_class = HTTP_TLS_ERR_TOFU_CHANGED;
++            }
++            http_query_disconnect(q);
++            http_query_complete(q, ERROR("TLS certificate rejected by TOFU"));
++            return;
++        }
++
++        log_debug(q->client->log, "HTTP %s: TLS handshake done", q->straddr.text);
++
+         q->handshake = false;
+         http_query_fdpoll_set_mask(q, ELOOP_FDPOLL_BOTH);
+     } else if (q->sending) {
+-#else
+-    if (q->sending) {
+-#endif // OH_AIRSCAN
+         rc = http_query_sock_send(q, q->rq_buf + q->rq_off, len);
+ 
+         if (rc > 0) {
+@@ -2876,39 +2895,34 @@ AGAIN:
+         goto AGAIN;
+     }
+ 
+-#ifndef OH_AIRSCAN
+     /* Setup TLS, if required */
+     if (q->uri->scheme == HTTP_SCHEME_HTTPS) {
+-        int rc = gnutls_init(&q->tls,
+-            GNUTLS_CLIENT | GNUTLS_NONBLOCK | GNUTLS_NO_SIGNAL);
+-
+-        if (rc == GNUTLS_E_SUCCESS) {
+-            rc = gnutls_set_default_priority(q->tls);
+-        }
+-
+-        if (rc == GNUTLS_E_SUCCESS) {
+-            rc = gnutls_credentials_set(q->tls, GNUTLS_CRD_CERTIFICATE,
+-                    gnutls_cred);
++        q->ssl = SSL_new(ssl_ctx);
++        if (q->ssl == NULL) {
++            err = ERROR("SSL_new() failed");
++            http_query_disconnect(q);
++            http_query_complete(q, err);
++            return;
+         }
+ 
+-        if (rc != GNUTLS_E_SUCCESS) {
+-            err = ERROR(gnutls_strerror(rc));
++        if (!SSL_set_fd(q->ssl, q->sock)) {
++            err = ERROR("SSL_set_fd() failed");
+             http_query_disconnect(q);
+             http_query_complete(q, err);
+             return;
+         }
+ 
+-        gnutls_transport_set_int(q->tls, q->sock);
++        const char *hostname = q->uri->host;
++        if (hostname != NULL) {
++            SSL_set_tlsext_host_name(q->ssl, hostname);
++        }
+     }
+-#endif // OH_AIRSCAN
+ 
+     /* Create fdpoll, and we are done */
+     q->fdpoll = eloop_fdpoll_new(q->sock, http_query_fdpoll_callback, q);
+-#ifndef OH_AIRSCAN
+-    if (q->tls != NULL) {
++    if (q->ssl != NULL) {
+         q->handshake = true;
+     }
+-#endif // OH_AIRSCAN
+     q->sending = true;
+     http_query_fdpoll_set_mask(q, ELOOP_FDPOLL_WRITE);
+ }
+@@ -2922,12 +2937,12 @@ http_query_disconnect (http_query *q)
+         eloop_fdpoll_free(q->fdpoll);
+         q->fdpoll = NULL;
+     }
+-#ifndef OH_AIRSCAN
+-    if (q->tls != NULL) {
+-        gnutls_deinit(q->tls);
+-        q->tls = NULL;
++
++    if (q->ssl != NULL) {
++        SSL_shutdown(q->ssl);
++        SSL_free(q->ssl);
++        q->ssl = NULL;
+     }
+-#endif // OH_AIRSCAN
+ 
+     if (q->sock >= 0) {
+         close(q->sock);
+@@ -2943,21 +2958,19 @@ static ssize_t
+ http_query_sock_send (http_query *q, const void *data, size_t size)
+ {
+     ssize_t rc;
+-#ifndef OH_AIRSCAN
+-    if (q->tls == NULL) {
+-#endif // OH_AIRSCAN
++
++    if (q->ssl == NULL) {
+         rc = send(q->sock, data, size, MSG_NOSIGNAL);
+         if (rc < 0) {
+             rc = -errno;
+         }
+-#ifndef OH_AIRSCAN
+     } else {
+-        rc = gnutls_record_send(q->tls, data, size);
+-        if (rc < 0) {
+-            gnutls_record_discard_queued(q->tls);
++        rc = SSL_write(q->ssl, data, size);
++        if (rc <= 0) {
++            rc = -SSL_get_error(q->ssl, rc);
+         }
+     }
+-#endif // OH_AIRSCAN
++
+     return rc;
+ }
+ 
+@@ -2967,18 +2980,19 @@ static ssize_t
+ http_query_sock_recv (http_query *q, void *data, size_t size)
+ {
+     ssize_t rc;
+-#ifndef OH_AIRSCAN
+-    if (q->tls == NULL) {
+-#endif // OH_AIRSCAN
++
++    if (q->ssl == NULL) {
+         rc = recv(q->sock, data, size, MSG_NOSIGNAL);
+         if (rc < 0) {
+             rc = -errno;
+         }
+-#ifndef OH_AIRSCAN
+     } else {
+-        rc = gnutls_record_recv(q->tls, data, size);
++        rc = SSL_read(q->ssl, data, size);
++        if (rc <= 0) {
++            rc = -SSL_get_error(q->ssl, rc);
++        }
+     }
+-#endif // OH_AIRSCAN
++
+     return rc;
+ }
+ 
+@@ -2990,9 +3004,8 @@ http_query_sock_err (http_query *q, int rc)
+ {
+     ELOOP_FDPOLL_MASK mask = 0;
+     error             err = NULL;
+-#ifndef OH_AIRSCAN
+-    if (q->tls == NULL) {
+-#endif // OH_AIRSCAN
++
++    if (q->ssl == NULL) {
+         rc = -rc;
+         switch (rc) {
+         case EINTR:
+@@ -3005,24 +3018,53 @@ http_query_sock_err (http_query *q, int rc)
+         default:
+             err = ERROR(strerror(errno));
+         }
+-#ifndef OH_AIRSCAN
+     } else {
++        /* rc is a negative SSL_ERROR_* value from sock_send/sock_recv */
++        rc = -rc;
+         switch (rc) {
+-        case GNUTLS_E_INTERRUPTED:
++        case SSL_ERROR_WANT_READ:
++            mask = ELOOP_FDPOLL_READ;
+             break;
+ 
+-        case GNUTLS_E_AGAIN:
+-            mask = gnutls_record_get_direction(q->tls) ?
+-                    ELOOP_FDPOLL_WRITE : ELOOP_FDPOLL_READ;
++        case SSL_ERROR_WANT_WRITE:
++            mask = ELOOP_FDPOLL_WRITE;
+             break;
+ 
+-        default:
+-            if (gnutls_error_is_fatal(rc)) {
+-                err = ERROR(gnutls_strerror(rc));
++        case SSL_ERROR_SYSCALL:
++            if (errno == EINTR) {
++                break;
++            }
++            err = ERROR(strerror(errno));
++            break;
++
++        case SSL_ERROR_SSL:
++            {
++                unsigned long e = ERR_get_error();
++                char *errbuf = mem_new(char, 256);
++                if (e != 0) {
++                    ERR_error_string_n(e, errbuf, 256);
++                } else if (q->ssl != NULL) {
++                    long vret = SSL_get_verify_result(q->ssl);
++                    if (vret != X509_V_OK) {
++                        snprintf(errbuf, 256,
++                            "certificate verify failed: %s",
++                            X509_verify_cert_error_string(vret));
++                    } else {
++                        snprintf(errbuf, 256, "unknown SSL error");
++                    }
++                } else {
++                    snprintf(errbuf, 256, "unknown SSL error");
++                }
++                err = ERROR(errbuf);
+             }
++            break;
++
++        default:
++            err = ERROR("SSL error");
++            break;
+         }
+     }
+-#endif // OH_AIRSCAN
++
+     if (mask != 0) {
+         http_query_fdpoll_set_mask(q, mask);
+     }
+@@ -3132,6 +3174,7 @@ http_query_start_processing (void *p)
+         q->rq_buf = str_append_mem(q->rq_buf,
+             q->request_data->bytes, q->request_data->size);
+     }
++
+     /* Connect to the host */
+     http_query_connect(q, ERROR("no host addresses available"));
+ }
+@@ -3237,6 +3280,14 @@ http_query_transport_error (const http_query *q)
+     return q->err;
+ }
+ 
++/* Get the TLS error class of a failed query (for completion-callback
++ * callers such as the devcaps probe). */
++http_tls_err_class
++http_query_tls_err_class (const http_query *q)
++{
++    return q->tls_err_class;
++}
++
+ /* Get HTTP status code. Code not available, if query finished
+  * with transport error
+  */
+@@ -3418,18 +3475,292 @@ http_query_test_decode_response (http_query *q, const void *data, size_t size)
+     return NULL;
+ }
+ 
+-/******************** HTTP initialization & cleanup ********************/
++/******************** TOFU (Trust On First Use) ********************/
++
++/* Build the cert file path (caller frees). */
++static char*
++http_tfu_cert_path (const char *host)
++{
++    char *path = mem_new(char, PATH_MAX);
++    snprintf(path, PATH_MAX, "%s/%s.crt", TLS_CERT_DIR, host);
++    return path;
++}
++
++/* Save the peer cert to the TOFU store. */
++static bool
++http_tfu_save_cert (const char *host, X509 *cert)
++{
++    char *path = http_tfu_cert_path(host);
++    FILE *fp;
++    bool  ok = false;
++
++    fp = fopen(path, "w");
++    if (fp == NULL) {
++        log_debug(NULL, "TOFU: cannot create %s: %s", path, strerror(errno));
++        mem_free(path);
++        return false;
++    }
++
++    fchmod(fileno(fp), 0600);
++
++    if (PEM_write_X509(fp, cert) == 1) {
++        ok = true;
++    } else {
++        log_debug(NULL, "TOFU: PEM_write_X509 failed for %s", path);
++        unlink(path);
++    }
++    fclose(fp);
++
++    mem_free(path);
++    return ok;
++}
++
++/* Build the pending cert file path (caller frees). */
++static char*
++http_tfu_pending_path (const char *host)
++{
++    char *path = mem_new(char, PATH_MAX);
++    snprintf(path, PATH_MAX, "%s/%s.crt.pending", TLS_CERT_DIR, host);
++    return path;
++}
++
++/* Save the changed peer cert for frontend confirmation.
++ * Written atomically (tmp + rename), owner-readable only. */
++static bool
++http_tfu_save_pending (const char *host, X509 *cert)
++{
++    char *path = http_tfu_pending_path(host);
++    char *tmp_path = mem_new(char, PATH_MAX);
++    FILE *fp;
++    bool  ok = false;
++
++    snprintf(tmp_path, PATH_MAX, "%s.tmp", path);
++    fp = fopen(tmp_path, "w");
++    if (fp == NULL) {
++        log_debug(NULL, "TOFU: cannot create %s: %s", tmp_path, strerror(errno));
++        mem_free(tmp_path);
++        mem_free(path);
++        return false;
++    }
++
++    fchmod(fileno(fp), 0600);
++    if (PEM_write_X509(fp, cert) == 1) {
++        fflush(fp);
++        fsync(fileno(fp));
++        ok = true;
++    }
++    fclose(fp);
++
++    if (ok && rename(tmp_path, path) != 0) {
++        log_debug(NULL, "TOFU: rename %s -> %s failed: %s", tmp_path, path, strerror(errno));
++        ok = false;
++    }
++    if (!ok) {
++        unlink(tmp_path);
++    }
++
++    mem_free(tmp_path);
++    mem_free(path);
++    return ok;
++}
++
++/* Load the saved certificate for host.
++ * Returns 0 = loaded, 1 = no baseline, -1 = corrupt/unreadable.
++ * A corrupt baseline is treated as a change, never as first use. */
++static int
++http_tfu_load_cert (const char *host, X509 **out)
++{
++    char *path = http_tfu_cert_path(host);
++    FILE *fp;
++    X509 *cert;
++
++    *out = NULL;
++
++    fp = fopen(path, "r");
++    if (fp == NULL) {
++        int missing = (errno == ENOENT);
++        mem_free(path);
++        return missing ? 1 : -1;
++    }
++
++    cert = PEM_read_X509(fp, NULL, NULL, NULL);
++    fclose(fp);
++    mem_free(path);
++
++    if (cert == NULL) {
++        /* Log the real parse error, then clear the queue. */
++        unsigned long e;
++        char errbuf[256];
++
++        while ((e = ERR_get_error()) != 0) {
++            ERR_error_string_n(e, errbuf, sizeof(errbuf));
++            log_debug(NULL, "TOFU: cannot parse saved certificate for %s: %s",
++                host, errbuf);
++        }
++        ERR_clear_error();
++        return -1;
++    }
++
++    *out = cert;
++    return 0;
++}
++
++/* Compare two certs by DER; 0 = identical. */
++static int
++http_tfu_cmp_cert (X509 *a, X509 *b)
++{
++    unsigned char *der_a = NULL, *der_b = NULL;
++    int            len_a, len_b;
++    int            result = -1;
++
++    len_a = i2d_X509(a, &der_a);
++    len_b = i2d_X509(b, &der_b);
++
++    if (len_a > 0 && len_b > 0 && len_a == len_b) {
++        result = memcmp(der_a, der_b, len_a);
++    }
++
++    OPENSSL_free(der_a);
++    OPENSSL_free(der_b);
++
++    return result;
++}
++
++/* Check the peer certificate with TOFU.
++ * Returns 0 = trust, -1 = changed/unreadable, 1 = first save failed.
++ * Only -1 maps to TOFU_CHANGED; 1 stays a generic IO error. */
++static int
++http_tfu_check (http_query *q)
++{
++    const char *host;
++    char        hostbuf[64];
++    X509       *peer_cert;
++    X509       *saved_cert = NULL;
++    int         load_rc;
++    int         result = 0;
++
++    if (q->ssl == NULL || q->uri == NULL) {
++        return 0;
++    }
++
++    /* Prefer URI host; otherwise strip the port from straddr. */
++    host = q->uri->host;
++    if (host == NULL || host[0] == '\0') {
++        size_t i, n = 0;
++        const char *s = q->straddr.text;
++        /* Strip ":port" (IPv6 straddr has no brackets). */
++        for (i = 0; s[i] != '\0'; i++) {
++            if (s[i] == ':') {
++                break;
++            }
++            if (n < sizeof(hostbuf) - 1) {
++                hostbuf[n++] = s[i];
++            }
++        }
++        hostbuf[n] = '\0';
++        host = hostbuf;
++    }
++
++    if (host[0] == '\0') {
++        /* No host identifier: TOFU not enforced. */
++        return 0;
++    }
++
++    /* OpenSSL 3.0+: use SSL_get1_peer_certificate(). */
++    peer_cert = SSL_get1_peer_certificate(q->ssl);
++    if (peer_cert == NULL) {
++        /* No peer cert: allow (some scanners use unusual TLS). */
++        return 0;
++    }
++
++    load_rc = http_tfu_load_cert(host, &saved_cert);
++
++    if (load_rc == 1) {
++        /* First use: save and trust. If save fails, reject — no
++         * baseline means no MITM protection. */
++        if (http_tfu_save_cert(host, peer_cert)) {
++            log_debug(q->client->log,
++                "HTTP %s: TLS first use, certificate saved", host);
++            result = 0;
++        } else {
++            log_debug(q->client->log,
++                "HTTP %s: TLS first use, cert save failed, rejecting", host);
++            /* Not a change: report generic failure (1), not TOFU_CHANGED. */
++            result = 1;
++        }
++    } else if (load_rc < 0) {
++        /* Corrupt baseline: treat as changed, snapshot the new cert
++         * and let the user confirm. Never silently replace it. */
++        log_debug(q->client->log,
++            "HTTP %s: saved certificate unreadable, treating as changed", host);
++        if (!http_tfu_save_pending(host, peer_cert)) {
++            log_debug(q->client->log,
++                "HTTP %s: TOFU pending save failed", host);
++        }
++        result = -1;
++    } else {
++        if (http_tfu_cmp_cert(peer_cert, saved_cert) == 0) {
++            /* Match: expired-but-unchanged is still trusted (TOFU
++             * tracks identity, not validity). */
++            const ASN1_TIME *notAfter = X509_get0_notAfter(peer_cert);
++            if (notAfter != NULL && X509_cmp_current_time(notAfter) < 0) {
++                log_debug(q->client->log,
++                    "HTTP %s: TLS certificate expired but unchanged, trusted",
++                    host);
++            } else {
++                log_debug(q->client->log,
++                    "HTTP %s: TLS certificate matches saved", host);
++            }
++            result = 0;
++        } else {
++            log_debug(q->client->log,
++                "HTTP %s: TLS certificate CHANGED (possible MITM), rejecting",
++                host);
++            /* Snapshot the new cert for frontend confirmation;
++             * a save failure still keeps the change semantics (-1). */
++            if (!http_tfu_save_pending(host, peer_cert)) {
++                log_debug(q->client->log,
++                    "HTTP %s: TOFU pending save failed", host);
++            }
++            result = -1;
++        }
++        X509_free(saved_cert);
++    }
++
++    X509_free(peer_cert);
++    return result;
++}
++
+ /* Initialize HTTP client
+  */
+ SANE_Status
+ http_init (void)
+ {
+-#ifndef OH_AIRSCAN
+-    int rc = gnutls_certificate_allocate_credentials(&gnutls_cred);
+-    return rc == GNUTLS_E_SUCCESS ? SANE_STATUS_GOOD : SANE_STATUS_NO_MEM;
+-#else 
++    SSL_library_init();
++    SSL_load_error_strings();
++    OpenSSL_add_all_algorithms();
++
++    ssl_ctx = SSL_CTX_new(TLS_client_method());
++    if (ssl_ctx == NULL) {
++        return SANE_STATUS_NO_MEM;
++    }
++
++    /* TLS 1.2+, strong ciphers only (OH CUPS pattern + !3DES):
++     * HIGH:!DH:+DHE:!aNULL:!3DES:!RC4:@STRENGTH
++     * TLS 1.3 uses OpenSSL defaults (all AEAD). */
++    SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
++    SSL_CTX_set_cipher_list(ssl_ctx,
++        "HIGH:!DH:+DHE:!aNULL:!3DES:!RC4:@STRENGTH");
++
++    /* TOFU: accept the handshake (self-signed certs are common on
++     * LAN scanners), then compare the peer cert with the saved one;
++     * first use saves it, a change is rejected. */
++    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
++
++    /* Cert dir is created by init (printservice.cfg, mode 0700);
++     * no fallback mkdir here. */
++
+     return SANE_STATUS_GOOD;
+-#endif // OH_AIRSCAN
+ }
+ 
+ /* Initialize HTTP client
+@@ -3437,12 +3842,12 @@ http_init (void)
+ void
+ http_cleanup (void)
+ {
+-#ifndef OH_AIRSCAN
+-    if (gnutls_cred != NULL) {
+-        gnutls_certificate_free_credentials(gnutls_cred);
+-        gnutls_cred = NULL;
++    if (ssl_ctx != NULL) {
++        SSL_CTX_free(ssl_ctx);
++        ssl_ctx = NULL;
+     }
+-#endif // OH_AIRSCAN
++    EVP_cleanup();
++    ERR_free_strings();
+ }
+ 
+ /* vim:ts=8:sw=4:et
+diff --git a/airscan.h b/airscan.h
+index 2c30c95..6354d49 100644
+--- a/airscan.h
++++ b/airscan.h
+@@ -1890,6 +1890,20 @@ http_data_queue_purge (http_data_queue *queue);
+  */
+ typedef struct http_client http_client;
+ 
++/* Internal TLS error classification, mapped to SANE_Status by the
++ * device layer.
++ *   NONE         — no/non-TLS error or TOFU first-save failure
++ *                  (stays IO_ERROR at the SANE boundary)
++ *   TOFU_CHANGED — cert mismatch; maps to SANE status 100 */
++typedef enum {
++    HTTP_TLS_ERR_NONE,
++    HTTP_TLS_ERR_TOFU_CHANGED
++} http_tls_err_class;
++
++/* On-error callback carrying the TLS error class. */
++typedef void (*http_onerror_cb)(void *ptr, error err,
++                                 http_tls_err_class tls_class);
++
+ /* Create new http_client
+  */
+ http_client*
+@@ -1905,8 +1927,7 @@ http_client_free (http_client *client);
+  * of the http_query callback
+  */
+ void
+-http_client_onerror (http_client *client,
+-        void (*callback)(void *ptr, error err));
++http_client_onerror (http_client *client, http_onerror_cb callback);
+ 
+ /* Cancel all pending queries, if any
+  */
+@@ -1990,7 +2011,7 @@ http_query_force_port(http_query *q, bool force_port);
+  * transport error.
+  */
+ void
+-http_query_onerror (http_query *q, void (*onerror)(void *ptr, error err));
++http_query_onerror (http_query *q, http_onerror_cb onerror);
+ 
+ /* Set on-redirect callback. It is called in a case of HTTP
+  * redirect and may modify the supplied URI
+@@ -2047,6 +2068,11 @@ http_query_error (const http_query *q);
+ error
+ http_query_transport_error (const http_query *q);
+ 
++/* Get the TLS error class of a failed query (for completion-callback
++ * callers such as the devcaps probe). */
++http_tls_err_class
++http_query_tls_err_class (const http_query *q);
++
+ /* Get HTTP status code. Code not available, if query finished
+  * with error
+  */
+@@ -2637,6 +2667,9 @@ enum {
+ #define OPTVAL_JUSTIFICATION_TOP    "top"
+ #define OPTVAL_JUSTIFICATION_BOTTOM "bottom"
+ 
++/* SANE_STATUS_TLS_CERT_CHANGED (100) is defined in <sane/sane.h>.
++ * All other TLS failures cross the SANE boundary as IO_ERROR. */
++
+ /* Define options not included in saneopts.h */
+ #define SANE_NAME_ADF_JUSTIFICATION_X  "adf-justification-x"
+ #define SANE_TITLE_ADF_JUSTIFICATION_X SANE_I18N("ADF Width Justification")

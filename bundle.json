@@ -27,7 +27,8 @@
                 "libpng",
                 "libjpeg-turbo",
                 "backends",
-                "libuv"
+                "libuv",
+                "openssl"
             ]
         },
         "build": {
