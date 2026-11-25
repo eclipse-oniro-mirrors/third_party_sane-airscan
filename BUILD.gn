@@ -15,8 +15,75 @@ import("//build/ohos.gni")
 
 source_dir = "//third_party/sane-airscan"
 
+# Files consumed by the build from the sane-airscan checkout. Every file
+# touched by patches/*.patch must be listed here: airscan_action patches a
+# private copy of these files under the build output directory and the
+# sane-airscan library compiles the patched copy, so the source checkout
+# stays pristine and all build products stay inside out/.
+airscan_c_sources = [
+  "airscan-array.c",
+  "airscan-bmp.c",
+  "airscan-conf.c",
+  "airscan-devcaps.c",
+  "airscan-device.c",
+  "airscan-devid.c",
+  "airscan-devops.c",
+  "airscan-eloop.c",
+  "airscan-escl.c",
+  "airscan-filter.c",
+  "airscan-http.c",
+  "airscan-id.c",
+  "airscan-image.c",
+  "airscan-init.c",
+  "airscan-ip.c",
+  "airscan-jpeg.c",
+  "airscan-log.c",
+  "airscan-math.c",
+  "airscan-memstr.c",
+  "airscan-netif.c",
+  "airscan-os.c",
+  "airscan-png.c",
+  "airscan-pollable.c",
+  "airscan-rand.c",
+  "airscan-trace.c",
+  "airscan-xml.c",
+  "airscan-zeroconf.c",
+  "airscan.c",
+  "http_parser.c",
+  "sane_strstatus.c",
+]
+airscan_files = airscan_c_sources + [
+  "airscan.h",
+  "http_parser.h",
+]
+
+# Files that are not compiled but are modified by patches/*.patch. They
+# are copied (and patched) into the shadow copy and declared as action
+# inputs so upstream changes to them correctly trigger a rebuild.
+airscan_patch_only = [
+  "airscan-mdns.c",
+  "airscan-tiff.c",
+  "airscan-wsd.c",
+]
+
+# Shadow copy of the patched sources, kept inside the build output tree
+# so the source checkout stays pristine. Kept at the root_out_dir level:
+# the object file layout is derived from the source path relative to the
+# source root, so any location under out/ nests under obj/out/<product>/;
+# the root_out_dir level is the shallowest possible form.
+code_out_dir = root_out_dir + "/third_party_sane_airsan"
+
+airscan_source_inputs = []
+foreach(name, airscan_files) {
+  airscan_source_inputs += [ "${source_dir}/${name}" ]
+}
+airscan_patch_only_inputs = []
+foreach(name, airscan_patch_only) {
+  airscan_patch_only_inputs += [ "${source_dir}/${name}" ]
+}
+
 action("airscan_action") {
-  script = "//third_party/sane-airscan/patch_install.py"
+  script = "${source_dir}/patch_install.py"
   inputs = [
     "${source_dir}/patches/oh-transplant.patch",
     "${source_dir}/patches/oh-fix-subtraction-underflow.patch",
@@ -28,18 +95,21 @@ action("airscan_action") {
     "${source_dir}/patches/oh-fix-eloop-uv-run-mutex-serialization.patch",
     "${source_dir}/patches/oh-fix-skip-branch-buffer-capacity.patch",
     "${source_dir}/patches/oh-escl-https-tofu.patch",
-  ]
-  outputs = [ "${target_gen_dir}/patches.complete" ]
-  depfile = "${target_gen_dir}/patches.d"
-  airscan_source_dir = rebase_path("${source_dir}", root_build_dir)
+  ] + airscan_source_inputs + airscan_patch_only_inputs
+  outputs = []
+  foreach(name, airscan_c_sources) {
+    outputs += [ "${code_out_dir}/${name}" ]
+  }
+
   args = [
     "--source-dir",
-    "$airscan_source_dir",
-    "--stamp",
-    rebase_path(outputs[0], root_build_dir),
-    "--depfile",
-    rebase_path(depfile, root_build_dir),
+    rebase_path(source_dir, root_build_dir),
+    "--dest-dir",
+    rebase_path("${code_out_dir}", root_build_dir),
   ]
+  foreach(name, airscan_files) {
+    args += [ "--file", name ]
+  }
 }
 
 config("airscan_config") {
@@ -57,40 +127,8 @@ config("airscan_config") {
 }
 
 ohos_shared_library("sane-airscan") {
-  include_dirs = [ "./airscan.h" ]
-  sources = [
-    "airscan-array.c",
-    "airscan-bmp.c",
-    "airscan-conf.c",
-    "airscan-devcaps.c",
-    "airscan-device.c",
-    "airscan-devid.c",
-    "airscan-devops.c",
-    "airscan-eloop.c",
-    "airscan-escl.c",
-    "airscan-filter.c",
-    "airscan-http.c",
-    "airscan-id.c",
-    "airscan-image.c",
-    "airscan-init.c",
-    "airscan-ip.c",
-    "airscan-jpeg.c",
-    "airscan-log.c",
-    "airscan-math.c",
-    "airscan-memstr.c",
-    "airscan-netif.c",
-    "airscan-os.c",
-    "airscan-png.c",
-    "airscan-pollable.c",
-    "airscan-rand.c",
-    "airscan-trace.c",
-    "airscan-xml.c",
-    "airscan-zeroconf.c",
-    "airscan.c",
-    "http_parser.c",
-    "sane_strstatus.c",
-  ]
-
+  include_dirs = [ "${code_out_dir}" ]
+  sources = get_target_outputs(":airscan_action")
   configs = [ ":airscan_config" ]
   deps = [ ":airscan_action" ]
   external_deps = [
